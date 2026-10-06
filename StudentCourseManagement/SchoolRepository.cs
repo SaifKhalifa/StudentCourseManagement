@@ -1,5 +1,5 @@
 ﻿using Dapper;
-using Microsoft.Data.SqlClient;
+using MySqlConnector;
 using System.Data;
 using System.Data.SqlTypes;
 using static StudentCourseManagement.Models;
@@ -10,9 +10,6 @@ public class SchoolRepository
 {
     public const int MaxCoursesPerStudent = 3;
     public const int MaxStudentsPerCourse = 8;
-
-    private const int SqlUniqueViolation = 2627;      // UNIQUE constraint
-    private const int SqlUniqueIndexViolation = 2601; // unique index
 
     private readonly string _connectionString;
 
@@ -28,7 +25,7 @@ public class SchoolRepository
         CurrentSemester = currentSemester.Trim();
     }
 
-    private SqlConnection Open() => new(_connectionString);
+    private MySqlConnection Open() => new(_connectionString);
 
     // ------------------------------------------------------------------
     // Create
@@ -46,15 +43,15 @@ public class SchoolRepository
         }
 
         const string sql = @"
-                            INSERT INTO dbo.Students (Name, Email) VALUES (@Name, @Email);
-                            SELECT CAST(SCOPE_IDENTITY() AS INT);";
+                            INSERT INTO Students (Name, Email) VALUES (@Name, @Email);
+                            SELECT CAST(LAST_INSERT_ID() AS SIGNED);";
 
         try
         {
             await using var conn = Open();
             return await conn.ExecuteScalarAsync<int>(sql, new { Name = name.Trim(), Email = email.Trim() });
         }
-        catch (SqlException ex) when (ex.Number is SqlUniqueViolation or SqlUniqueIndexViolation)
+        catch (MySqlException ex) when (ex.ErrorCode == MySqlErrorCode.DuplicateKeyEntry)
         {
             throw new DuplicateNameException($"A student with email '{email}' already exists.");
         }
@@ -68,8 +65,8 @@ public class SchoolRepository
         }
 
         const string sql = @"
-                            INSERT INTO dbo.Courses (Name) VALUES (@Name);
-                            SELECT CAST(SCOPE_IDENTITY() AS INT);";
+                            INSERT INTO Courses (Name) VALUES (@Name);
+                            SELECT CAST(LAST_INSERT_ID() AS SIGNED);";
 
         await using var conn = Open();
         return await conn.ExecuteScalarAsync<int>(sql, new { Name = name.Trim() });
@@ -86,10 +83,10 @@ public class SchoolRepository
         await conn.OpenAsync();
 
         await using var tx = await conn.BeginTransactionAsync(IsolationLevel.ReadCommitted);
-        
+
         var changed = await conn.ExecuteAsync
             (
-                "UPDATE dbo.Students SET IsActive = 0 WHERE Id = @Id AND IsActive = 1;",
+                "UPDATE Students SET IsActive = 0 WHERE Id = @Id AND IsActive = 1;",
                 new { Id = studentId }, tx
             );
 
@@ -98,7 +95,7 @@ public class SchoolRepository
 
         var removed = await conn.ExecuteAsync
             (
-                "DELETE FROM dbo.Enrollments WHERE StudentId = @Id AND Semester = @Semester;",
+                "DELETE FROM Enrollments WHERE StudentId = @Id AND Semester = @Semester;",
                 new { Id = studentId, Semester = CurrentSemester }, tx
             );
 
@@ -115,7 +112,7 @@ public class SchoolRepository
 
         var changed = await conn.ExecuteAsync
             (
-                "UPDATE dbo.Courses SET IsActive = 0 WHERE Id = @Id AND IsActive = 1;",
+                "UPDATE Courses SET IsActive = 0 WHERE Id = @Id AND IsActive = 1;",
                 new { Id = courseId }, tx
             );
 
@@ -124,7 +121,7 @@ public class SchoolRepository
 
         var removed = await conn.ExecuteAsync
             (
-                "DELETE FROM dbo.Enrollments WHERE CourseId = @Id AND Semester = @Semester;",
+                "DELETE FROM Enrollments WHERE CourseId = @Id AND Semester = @Semester;",
                 new { Id = courseId, Semester = CurrentSemester }, tx
             );
 
@@ -143,15 +140,16 @@ public class SchoolRepository
 
         await using var tx = await conn.BeginTransactionAsync(IsolationLevel.ReadCommitted);
 
+        // FOR UPDATE = MySQL's version of UPDLOCK: locks the row until the transaction ends.
         var student = await conn.QuerySingleOrDefaultAsync<Student>
             (
-                "SELECT Id, Name, Email, IsActive FROM dbo.Students WITH (UPDLOCK, ROWLOCK) WHERE Id = @Id;",
+                "SELECT Id, Name, Email, IsActive FROM Students WHERE Id = @Id FOR UPDATE;",
                 new { Id = studentId }, tx
             );
 
         var course = await conn.QuerySingleOrDefaultAsync<Course>
             (
-                "SELECT Id, Name, IsActive FROM dbo.Courses WITH (UPDLOCK, ROWLOCK) WHERE Id = @Id;",
+                "SELECT Id, Name, IsActive FROM Courses WHERE Id = @Id FOR UPDATE;",
                 new { Id = courseId }, tx
             );
 
@@ -164,28 +162,28 @@ public class SchoolRepository
 
         var already = await conn.ExecuteScalarAsync<int>
             (
-                "SELECT COUNT(1) FROM dbo.Enrollments WHERE StudentId = @StudentId AND CourseId = @CourseId AND Semester = @Semester;",
+                "SELECT COUNT(1) FROM Enrollments WHERE StudentId = @StudentId AND CourseId = @CourseId AND Semester = @Semester;",
                 args, tx
             );
-        
+
         if (already > 0)
             throw new SqlAlreadyFilledException($"'{student.Name}' is already enrolled in '{course.Name}' for {CurrentSemester}.");
 
         var studentCount = await conn.ExecuteScalarAsync<int>
             (
-                "SELECT COUNT(1) FROM dbo.Enrollments WHERE StudentId = @StudentId AND Semester = @Semester;",
+                "SELECT COUNT(1) FROM Enrollments WHERE StudentId = @StudentId AND Semester = @Semester;",
                 args, tx
             );
-        
+
         if (studentCount >= MaxCoursesPerStudent)
             throw new SqlAlreadyFilledException($"'{student.Name}' already has {MaxCoursesPerStudent} courses in {CurrentSemester} (maximum).");
 
         var courseCount = await conn.ExecuteScalarAsync<int>
             (
-                "SELECT COUNT(1) FROM dbo.Enrollments WHERE CourseId = @CourseId AND Semester = @Semester;",
+                "SELECT COUNT(1) FROM Enrollments WHERE CourseId = @CourseId AND Semester = @Semester;",
                 args, tx
             );
-        
+
         if (courseCount >= MaxStudentsPerCourse)
             throw new SqlAlreadyFilledException($"'{course.Name}' is full: {MaxStudentsPerCourse} students in {CurrentSemester} (maximum).");
 
@@ -194,16 +192,16 @@ public class SchoolRepository
             var id = await conn.ExecuteScalarAsync<int>
                 (
                 @"
-                    INSERT INTO dbo.Enrollments (StudentId, CourseId, Semester)
+                    INSERT INTO Enrollments (StudentId, CourseId, Semester)
                     VALUES (@StudentId, @CourseId, @Semester);
-                    SELECT CAST(SCOPE_IDENTITY() AS INT);",
+                    SELECT CAST(LAST_INSERT_ID() AS SIGNED);",
                     args, tx
                 );
 
             await tx.CommitAsync();
             return id;
         }
-        catch (SqlException ex) when (ex.Number is SqlUniqueViolation or SqlUniqueIndexViolation)
+        catch (MySqlException ex) when (ex.ErrorCode == MySqlErrorCode.DuplicateKeyEntry)
         {
             throw new SqlAlreadyFilledException($"'{student.Name}' is already enrolled in '{course.Name}' for {CurrentSemester}.");
         }
@@ -215,7 +213,7 @@ public class SchoolRepository
 
     public async Task<IReadOnlyList<EnrollmentView>> QueryEnrollmentsAsync(EnrollmentFilter? filter = null)
     {
-        filter = new EnrollmentFilter();
+        filter ??= new EnrollmentFilter();
 
         const string sql = @"
                 SELECT  e.Id        AS EnrollmentId,
@@ -226,9 +224,9 @@ public class SchoolRepository
                         c.Name      AS CourseName,
                         c.IsActive  AS CourseIsActive,
                         e.Semester  AS Semester
-                FROM    dbo.Enrollments e
-                JOIN    dbo.Students s ON s.Id = e.StudentId
-                JOIN    dbo.Courses  c ON c.Id = e.CourseId
+                FROM    Enrollments e
+                JOIN    Students s ON s.Id = e.StudentId
+                JOIN    Courses  c ON c.Id = e.CourseId
                 WHERE   (@StudentId   IS NULL OR s.Id       = @StudentId)
                   AND   (@StudentName IS NULL OR s.Name     = @StudentName)
                   AND   (@CourseId    IS NULL OR c.Id       = @CourseId)
